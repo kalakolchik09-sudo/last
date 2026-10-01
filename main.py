@@ -4,10 +4,12 @@ import random
 import string
 import datetime
 import aiosqlite
+from io import BytesIO
 from dotenv import load_dotenv
-from telethon import TelegramClient, errors
+import qrcode
+from telethon import TelegramClient, errors, functions
 from telethon.sessions import StringSession
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ConversationHandler, MessageHandler, filters, ContextTypes
@@ -23,18 +25,15 @@ DB_PATH = "broadcaster.db"
 
 # ============ СОСТОЯНИЯ ============
 (
-    ASK_LICENSE,
-    ASK_PHONE, ASK_CODE, ASK_2FA,
+    ASK_PHONE_QR, ASK_2FA_QR,
     ASK_MODE,
     ASK_NORMAL_TEXT,
     ASK_SAFE_TEXT_1, ASK_SAFE_TEXT_2, ASK_SAFE_TEXT_3,
     ASK_INTERVAL,
-) = range(10)
+) = range(8)
 
-# Активные сессии авторизации (в памяти)
-pending_auth = {}          # user_id -> dict(client, phone, phone_code_hash)
-active_clients = {}        # user_id -> TelegramClient (активные userbot'ы)
-running_broadcasts = {}    # user_id -> bool флаг остановки
+pending_auth = {}          # user_id -> dict(client, qr_login)
+running_broadcasts = {}    # user_id -> bool
 
 
 # ==================== БД ====================
@@ -141,12 +140,6 @@ async def get_accounts(user_id: int):
             return await cur.fetchall()
 
 
-async def delete_account(account_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM user_accounts WHERE id = ?", (account_id,))
-        await db.commit()
-
-
 async def save_settings(user_id: int, **kwargs):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -167,7 +160,6 @@ async def save_settings(user_id: int, **kwargs):
 
 async def get_settings(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.row_factory
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM user_settings WHERE user_id = ?", (user_id,)
@@ -176,139 +168,173 @@ async def get_settings(user_id: int):
             return dict(row) if row else None
 
 
-# ==================== АВТОРИЗАЦИЯ АККАУНТА ====================
-async def start_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало добавления аккаунта"""
+# ==================== QR-АВТОРИЗАЦИЯ ====================
+async def start_qr_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало QR-авторизации"""
     user_id = update.effective_user.id
     if not await check_access(user_id):
         await update.message.reply_text("❌ Нет активной лицензии")
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        "📱 Введите номер телефона в формате +380XXXXXXXXX\n"
-        "Отмена: /cancel"
-    )
-    return ASK_PHONE
-
-
-async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    phone = update.message.text.strip()
-
+    # Создаём клиент
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
 
-    try:
-        sent = await client.send_code_request(phone)
-        pending_auth[user_id] = {
-            "client": client,
-            "phone": phone,
-            "phone_code_hash": sent.phone_code_hash,
-        }
-        await update.message.reply_text(
-            "📨 Введите код из Telegram (только цифры, например 12345):"
-        )
-        return ASK_CODE
-    except Exception as e:
-        await client.disconnect()
-        await update.message.reply_text(f"❌ Ошибка: {e}\nПопробуйте /add_account")
-        return ConversationHandler.END
+    # Запускаем QR-логин
+    qr_login = await client.qr_login()
+
+    # Генерируем QR-картинку из URL
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(qr_login.url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+
+    # Отправляем фото с инструкцией
+    caption = (
+        "📱 **QR-авторизация**\n\n"
+        "1. Откройте Telegram на телефоне (где вы уже авторизованы)\n"
+        "2. Перейдите: **Настройки → Устройства → Подключить устройство**\n"
+        "3. Отсканируйте QR-код выше\n"
+        "4. Подтвердите вход\n\n"
+        "⏳ QR-код действует 2 минуты.\n"
+        "Если истёк — напишите /add_account заново."
+    )
+    await update.message.reply_photo(
+        photo=InputFile(buf, filename="qr.png"),
+        caption=caption,
+        parse_mode="Markdown"
+    )
+
+    pending_auth[user_id] = {
+        "client": client,
+        "qr_login": qr_login,
+        "started_at": datetime.datetime.now()
+    }
+
+    return ASK_PHONE_QR
 
 
-async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    code = update.message.text.strip().replace(" ", "")
+async def wait_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ждём сканирования QR (в фоне) — здесь ловим только сообщения пользователя"""
+    # Этот хэндлер не используется, так как ожидание идёт в отдельной задаче
+    return ASK_PHONE_QR
 
+
+async def qr_wait_task(user_id: int, bot):
+    """Фоновая задача: ждёт сканирования QR и обрабатывает результат"""
     auth = pending_auth.get(user_id)
     if not auth:
-        await update.message.reply_text("Сессия истекла. /add_account")
-        return ConversationHandler.END
+        return
 
     client = auth["client"]
+    qr_login = auth["qr_login"]
+
     try:
-        await client.sign_in(
-            phone=auth["phone"],
-            code=code,
-            phone_code_hash=auth["phone_code_hash"]
-        )
+        # Ждём сканирования (максимум 120 секунд)
+        result = await qr_login.wait(timeout=120)
+
+        # Проверяем, не нужен ли 2FA
+        if isinstance(result, bool) and result:
+            # Успешный вход
+            session_str = client.session.save()
+            me = await client.get_me()
+            phone = me.phone or "unknown"
+
+            await save_account(user_id, session_str, phone)
+            await client.disconnect()
+            pending_auth.pop(user_id, None)
+
+            await bot.send_message(
+                user_id,
+                f"✅ Аккаунт `{phone}` успешно добавлен!\n\n"
+                f"Используйте /menu для дальнейших действий.",
+                parse_mode="Markdown"
+            )
+        else:
+            # QR истёк, нужно обновить
+            await bot.send_message(
+                user_id,
+                "⏰ QR-код истёк. Напишите /add_account, чтобы получить новый."
+            )
+            await client.disconnect()
+            pending_auth.pop(user_id, None)
+
     except errors.SessionPasswordNeededError:
-        await update.message.reply_text(
-            "🔐 Введите пароль двухфакторной аутентификации (2FA):"
+        # Нужен 2FA пароль
+        await bot.send_message(
+            user_id,
+            "🔐 На аккаунте включена двухфакторная аутентификация.\n"
+            "Введите пароль (cloud password) от Telegram:"
         )
-        return ASK_2FA
-    except Exception as e:
+        # Оставляем клиент в pending_auth, переключаемся на состояние 2FA
+        # Но нам нужно как-то переключить состояние диалога...
+        # Проще: попросим пользователя написать пароль, а обработаем в отдельном хэндлере
+        auth["need_2fa"] = True
+        return
+
+    except asyncio.TimeoutError:
+        await bot.send_message(
+            user_id,
+            "⏰ Время ожидания истекло. Напишите /add_account для новой попытки."
+        )
         await client.disconnect()
         pending_auth.pop(user_id, None)
-        await update.message.reply_text(f"❌ Ошибка входа: {e}")
-        return ConversationHandler.END
 
-    # Успешный вход
-    session_str = client.session.save()
-    await save_account(user_id, session_str, auth["phone"])
-    await client.disconnect()
-    pending_auth.pop(user_id, None)
-
-    await update.message.reply_text(
-        f"✅ Аккаунт {auth['phone']} добавлен!\n\nИспользуйте /menu"
-    )
-    return ConversationHandler.END
+    except Exception as e:
+        await bot.send_message(user_id, f"❌ Ошибка: {e}")
+        await client.disconnect()
+        pending_auth.pop(user_id, None)
 
 
-async def ask_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def qr_2fa_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ввода 2FA пароля после QR"""
     user_id = update.effective_user.id
-    password = update.message.text.strip()
-
     auth = pending_auth.get(user_id)
-    if not auth:
-        await update.message.reply_text("Сессия истекла. /add_account")
-        return ConversationHandler.END
 
+    if not auth or not auth.get("need_2fa"):
+        return
+
+    password = update.message.text.strip()
     client = auth["client"]
+
     try:
         await client.sign_in(password=password)
-    except Exception as e:
+        session_str = client.session.save()
+        me = await client.get_me()
+        phone = me.phone or "unknown"
+
+        await save_account(user_id, session_str, phone)
         await client.disconnect()
         pending_auth.pop(user_id, None)
-        await update.message.reply_text(f"❌ Ошибка 2FA: {e}")
-        return ConversationHandler.END
 
-    session_str = client.session.save()
-    await save_account(user_id, session_str, auth["phone"])
-    await client.disconnect()
-    pending_auth.pop(user_id, None)
-
-    await update.message.reply_text(
-        f"✅ Аккаунт {auth['phone']} добавлен!\n\nИспользуйте /menu"
-    )
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    auth = pending_auth.pop(user_id, None)
-    if auth:
-        await auth["client"].disconnect()
-    await update.message.reply_text("Отменено")
-    return ConversationHandler.END
-
-
-# ==================== ПОЛУЧЕНИЕ ГРУПП ====================
-async def get_user_groups(client: TelegramClient):
-    """Возвращает список групп (id) где состоит аккаунт"""
-    groups = []
-    async for dialog in client.iter_dialogs():
-        if dialog.is_group or dialog.is_channel:
-            # Пропускаем broadcast-каналы (write forbidden)
-            if dialog.is_channel and not dialog.entity.broadcast:
-                groups.append(dialog.id)
-            elif dialog.is_group:
-                groups.append(dialog.id)
-    return groups
+        await update.message.reply_text(
+            f"✅ Аккаунт `{phone}` добавлен!\n\n/menu",
+            parse_mode="Markdown"
+        )
+    except errors.PasswordHashInvalidError:
+        await update.message.reply_text("❌ Неверный пароль. Попробуйте ещё раз:")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await client.disconnect()
+        pending_auth.pop(user_id, None)
 
 
 # ==================== РАССЫЛКА ====================
+async def get_user_groups(client: TelegramClient):
+    groups = []
+    async for dialog in client.iter_dialogs():
+        if dialog.is_group:
+            groups.append(dialog.id)
+        elif dialog.is_channel and not dialog.entity.broadcast:
+            groups.append(dialog.id)
+    return groups
+
+
 async def run_broadcast(user_id: int, bot):
-    """Основной цикл рассылки для конкретного пользователя"""
     settings = await get_settings(user_id)
     if not settings:
         await bot.send_message(user_id, "❌ Настройки не найдены")
@@ -319,17 +345,17 @@ async def run_broadcast(user_id: int, bot):
         await bot.send_message(user_id, "❌ Нет добавленных аккаунтов")
         return
 
-    mode = settings["mode"] or "normal"
-    interval = settings["interval"] or 60
+    mode = settings.get("mode") or "normal"
+    interval = settings.get("interval") or 60
 
     if mode == "safe":
         texts = [
-            settings["safe_text1"] or "Привет!",
-            settings["safe_text2"] or "Здравствуйте!",
-            settings["safe_text3"] or "Добрый день!",
+            settings.get("safe_text1") or "Привет!",
+            settings.get("safe_text2") or "Здравствуйте!",
+            settings.get("safe_text3") or "Добрый день!",
         ]
     else:
-        texts = [settings["normal_text"] or "Привет!"]
+        texts = [settings.get("normal_text") or "Привет!"]
 
     await bot.send_message(user_id, f"🚀 Рассылка запущена (режим: {mode})")
 
@@ -353,9 +379,7 @@ async def run_broadcast(user_id: int, bot):
                 await client.disconnect()
                 continue
 
-            await bot.send_message(
-                user_id, f"📤 {phone}: найдено {len(groups)} групп"
-            )
+            await bot.send_message(user_id, f"📤 {phone}: найдено {len(groups)} групп")
 
             flood_count = 0
             idx = 0
@@ -363,10 +387,7 @@ async def run_broadcast(user_id: int, bot):
                 if not running_broadcasts.get(user_id, False):
                     break
                 if flood_count >= 3:
-                    await bot.send_message(
-                        user_id,
-                        f"⚠️ {phone}: 3 FloodWait → пропуск аккаунта"
-                    )
+                    await bot.send_message(user_id, f"⚠️ {phone}: 3 FloodWait → пропуск")
                     break
 
                 text = texts[idx % len(texts)]
@@ -375,20 +396,13 @@ async def run_broadcast(user_id: int, bot):
                 try:
                     await client.send_message(group_id, text)
                     total_sent += 1
-
-                    if mode == "safe":
-                        delay = interval * random.uniform(0.8, 1.2)
-                    else:
-                        delay = interval
+                    delay = interval * random.uniform(0.8, 1.2) if mode == "safe" else interval
                     await asyncio.sleep(delay)
-
                 except errors.FloodWait as e:
                     flood_count += 1
                     await asyncio.sleep(e.value * 1.3)
                 except errors.PeerFloodError:
-                    await bot.send_message(
-                        user_id, f"❌ {phone}: PeerFlood, пропуск"
-                    )
+                    await bot.send_message(user_id, f"❌ {phone}: PeerFlood, пропуск")
                     break
                 except Exception as ex:
                     print(f"[ERR] {phone} → {group_id}: {ex}")
@@ -410,9 +424,7 @@ async def start_broadcast_setup(update: Update, context: ContextTypes.DEFAULT_TY
 
     accounts = await get_accounts(user_id)
     if not accounts:
-        await update.message.reply_text(
-            "❌ Сначала добавьте аккаунт: /add_account"
-        )
+        await update.message.reply_text("❌ Сначала добавьте аккаунт: /add_account")
         return ConversationHandler.END
 
     kb = [
@@ -490,8 +502,7 @@ async def get_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(run_broadcast(user_id, context.bot))
 
     await update.message.reply_text(
-        f"🚀 Рассылка запущена!\nРежим: {mode}\nИнтервал: {interval}с\n\n"
-        f"Остановить: /stop"
+        f"🚀 Рассылка запущена!\nРежим: {mode}\nИнтервал: {interval}с\n\nОстановить: /stop"
     )
     return ConversationHandler.END
 
@@ -524,7 +535,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if query.data == "add_account":
-        await query.edit_message_text("📱 Введите номер: /add_account")
+        await query.edit_message_text("📱 Отправьте /add_account для QR-авторизации")
     elif query.data == "start_bc":
         await query.edit_message_text("🚀 Запуск: /broadcast")
     elif query.data == "list_accounts":
@@ -550,12 +561,8 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Введите ключ: /activate ВАШ_КЛЮЧ")
         return
-    kb = [
-        [InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")],
-    ]
-    await update.message.reply_text(
-        "🔧 Админ-панель", reply_markup=InlineKeyboardMarkup(kb)
-    )
+    kb = [[InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")]]
+    await update.message.reply_text("🔧 Админ-панель", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -568,15 +575,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton(f"{d} дн.", callback_data=f"key_{d}")]
               for d in [1, 2, 3, 4, 30, 360]]
         kb.append([InlineKeyboardButton("♾ Безлимит", callback_data="key_-1")])
-        await query.edit_message_text("Срок:",
-                                       reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text("Срок:", reply_markup=InlineKeyboardMarkup(kb))
     elif query.data.startswith("key_"):
         days = int(query.data.split("_")[1])
         key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
         await create_key(key, days)
         label = "бессрочно" if days == -1 else f"{days} дн."
-        await query.edit_message_text(f"✅ Ключ ({label}):\n`{key}`",
-                                       parse_mode="Markdown")
+        await query.edit_message_text(f"✅ Ключ ({label}):\n`{key}`", parse_mode="Markdown")
 
 
 async def activate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,9 +593,7 @@ async def activate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         await update.message.reply_text(f"❌ {err}")
     elif exp:
-        await update.message.reply_text(
-            f"✅ Доступ до {exp.strftime('%d.%m.%Y %H:%M')}\n\n/menu"
-        )
+        await update.message.reply_text(f"✅ Доступ до {exp.strftime('%d.%m.%Y %H:%M')}\n\n/menu")
     else:
         await update.message.reply_text("✅ Бессрочный доступ!\n\n/menu")
 
@@ -602,15 +605,14 @@ async def main():
 
     app = Application.builder().token(ADMIN_BOT_TOKEN).build()
 
-    # Диалог добавления аккаунта
-    add_acc_conv = ConversationHandler(
-        entry_points=[CommandHandler("add_account", start_auth)],
+    # Диалог QR-авторизации
+    qr_conv = ConversationHandler(
+        entry_points=[CommandHandler("add_account", start_qr_auth)],
         states={
-            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
-            ASK_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_code)],
-            ASK_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_2fa)],
+            ASK_PHONE_QR: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_qr_scan)],
+            ASK_2FA_QR: [MessageHandler(filters.TEXT & ~filters.COMMAND, qr_2fa_handler)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
         per_user=True,
     )
 
@@ -625,11 +627,11 @@ async def main():
             ASK_SAFE_TEXT_3: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_safe_text3)],
             ASK_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_interval)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
         per_user=True,
     )
 
-    app.add_handler(add_acc_conv)
+    app.add_handler(qr_conv)
     app.add_handler(bc_conv)
     app.add_handler(CommandHandler("start", admin_start))
     app.add_handler(CommandHandler("menu", menu))
